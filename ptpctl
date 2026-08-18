@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+PTPCTL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export PTPCTL_ROOT
+# shellcheck source=lib/ptp_common.sh
+source "$PTPCTL_ROOT/lib/ptp_common.sh"
+# shellcheck source=lib/config.sh
+source "$PTPCTL_ROOT/lib/config.sh"
+# shellcheck source=lib/discovery.sh
+source "$PTPCTL_ROOT/lib/discovery.sh"
+# shellcheck source=lib/runtime.sh
+source "$PTPCTL_ROOT/lib/runtime.sh"
+# shellcheck source=lib/wizard.sh
+source "$PTPCTL_ROOT/lib/wizard.sh"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  sudo ./ptpctl
+  ./ptpctl probe
+  ./ptpctl doctor
+  ./ptpctl status
+  sudo ./ptpctl stop
+  sudo ./ptpctl setup I350-master [--dry-run]
+  sudo ./ptpctl setup I350-slave  [--dry-run]
+  sudo ./ptpctl setup X710-master [--dry-run]
+  sudo ./ptpctl setup X710-slave  [--dry-run]
+
+Dry-run performs discovery, selection, validation, config rendering, clock
+policy checks, and command planning without starting or stopping a process.
+
+With no arguments, ptpctl runs the interactive setup wizard, discovers all
+Linux hardware values, and asks only for site-owned PTP settings.
+EOF
+}
+
+ptp_open_command_log() {
+    local command_name=$1
+    mkdir -p "$PTP_LOG_DIR"
+    PTP_COMMAND_LOG="$PTP_LOG_DIR/$command_name-$(date +%Y%m%d-%H%M%S).log"
+    exec > >(tee -a "$PTP_COMMAND_LOG") 2>&1
+}
+
+cmd_probe() {
+    ptp_open_command_log probe
+    ptp_require_linux || return
+    ptp_require_commands lspci ethtool ip ptp4l systemctl pgrep || return
+    ptp_probe_report
+    local inventory_file="$PTP_STATE_DIR/server_inventory.txt"
+    if ptp_write_inventory "$inventory_file"; then
+        echo
+        echo "Inventory: $inventory_file"
+    else
+        ptp_warn "Could not update inventory: $inventory_file"
+    fi
+    local raw_log="$PTP_LOG_DIR/probe-raw-$(date +%Y%m%d-%H%M%S).log" record iface
+    {
+        echo "=== lspci -Dnnk ==="; lspci -Dnnk 2>&1
+        echo "=== ip -br link ==="; ip -br link 2>&1
+        echo "=== ip -br addr ==="; ip -br addr 2>&1
+        echo "=== /dev/ptp* ==="; ls -l /dev/ptp* 2>&1 || true
+        for record in "${PTP_CANDIDATES[@]}"; do
+            iface="$(ptp_candidate_field "$record" 1)"
+            echo "=== ethtool -i $iface ==="; ethtool -i "$iface" 2>&1
+            echo "=== ethtool -T $iface ==="; ethtool -T "$iface" 2>&1
+        done
+    } > "$raw_log"
+    echo
+    echo "Summary log: $PTP_COMMAND_LOG"
+    echo "Raw probe log: $raw_log"
+}
+
+cmd_doctor() {
+    ptp_open_command_log doctor
+    local problems=0 key value
+    echo "PTP Doctor"
+    echo
+    echo "Installation requirements:"
+    ptp_require_linux || problems=1
+    ptp_require_commands bash lspci ip ethtool ptp4l phc2sys pmc systemctl timedatectl setsid flock pgrep || problems=1
+    echo
+    if ptp_load_site_config; then
+        echo "Site configuration: $PTPCTL_ROOT/configs/site.env"
+        for key in PTP_DOMAIN PTP_TRANSPORT PTP_DELAY_MECHANISM PTP_PROFILE TRANSPORT_SPECIFIC \
+            GRANDMASTER_DISCOVERY SLAVE_CLOCK_POLICY SLAVE_TAI_UTC_POLICY MASTER_TIME_POLICY MASTER_UTC_OFFSET \
+            MASTER_UTC_OFFSET_AUTHORITY; do
+            value=${!key}
+            printf '  %-28s %s\n' "$key" "$value"
+            ptp_is_todo "$value" && problems=1
+        done
+    else
+        problems=1
+    fi
+    echo
+    ptp_probe_report || problems=1
+    [[ ${#PTP_CANDIDATES[@]} -gt 0 ]] || problems=1
+    echo
+    echo "Clock services and PTP processes:"
+    ptp_clock_service_report
+    if pgrep -x ptp4l >/dev/null 2>&1 || pgrep -x phc2sys >/dev/null 2>&1; then
+        echo "Existing PTP processes are acceptable only if they belong to the active ptpctl state."
+    fi
+    echo
+    if (( problems == 0 )); then
+        ptp_ok "No pre-deployment problem detected"
+    else
+        ptp_warn "Doctor found missing hardware, tools, or unresolved site values; review the report above"
+    fi
+    echo "Raw log: $PTP_COMMAND_LOG"
+    return "$problems"
+}
+
+ptp_dry_run_plan() {
+    local temp_config uds="$PTP_RUN_DIR/ptp4l.sock"
+    temp_config="$(mktemp)" || return
+    if ! ptp_generate_runtime_config "$PTP_ROLE" "$PTP_IFACE" "$temp_config" "$uds"; then
+        rm -f "$temp_config"; return 1
+    fi
+    echo
+    echo "=== DRY RUN: generated ptp4l configuration ==="
+    sed -n '1,260p' "$temp_config"
+    echo
+    echo "=== DRY RUN: process plan ==="
+    echo "ptp4l -f <runtime-config> -H -i $PTP_IFACE"
+    if [[ $PTP_ROLE == slave ]]; then
+        echo "wait for pmc PORT_DATA_SET state SLAVE"
+        echo "verify TIME_PROPERTIES_DATA_SET: ptpTimescale=1 and currentUtcOffsetValid=1"
+        echo "phc2sys -a -r -f configs/phc2sys.conf --domainNumber $PTP_DOMAIN --transportSpecific $TRANSPORT_SPECIFIC -z <ptp4l-uds>"
+    else
+        echo "pre-align PHC: phc2sys -s CLOCK_REALTIME -c $PTP_IFACE -O $MASTER_UTC_OFFSET"
+        echo "start ptp4l only after PHC pre-alignment is producing valid samples"
+        echo "wait for pmc PORT_DATA_SET state MASTER"
+        echo "phc2sys -a -r -r -f configs/phc2sys.conf --domainNumber $PTP_DOMAIN --transportSpecific $TRANSPORT_SPECIFIC -z <ptp4l-uds>"
+        if [[ $MASTER_TIME_POLICY == ALLOW_LAB_FREERUN ]]; then
+            echo "LAB WARNING: protocol master only; system time is not required to be traceable"
+        fi
+    fi
+    echo
+    echo "No process, clock, link, service, runtime state, or persistent configuration was changed."
+    rm -f "$temp_config"
+}
+
+ptp_setup_fail() {
+    local message=$1
+    ptp_error "$message"
+    ptp_rollback_started
+    return 1
+}
+
+cmd_setup() {
+    local mode=${1:-} dry_run=0 arg
+    shift || true
+    for arg in "$@"; do
+        case "$arg" in --dry-run) dry_run=1 ;; *) ptp_die "Unknown setup option: $arg" || return ;; esac
+    done
+    [[ -n $mode ]] || { ptp_die "setup requires one of four modes" || true; usage >&2; return 2; }
+    ptp_mode_parse "$mode" || return
+    ptp_load_site_config || return
+    ptp_config_require_role "$PTP_ROLE" || return
+    ptp_validate_profile_extra || return
+    ptp_require_linux || return
+    ptp_require_commands lspci ip ethtool ptp4l phc2sys pmc systemctl timedatectl setsid flock pgrep || return
+    ptp_discover_candidates || return
+    ptp_select_candidate "$PTP_FAMILY" || return
+    ptp_validate_selected_candidate "$PTP_SELECTED_CANDIDATE" yes || return
+    ptp_selected_unpack
+    ptp_check_existing_ptp_processes || return
+    ptp_check_role_clock_policy "$PTP_ROLE" || return
+    echo
+    ptp_print_selection_summary
+
+    if (( dry_run == 1 )); then
+        ptp_dry_run_plan
+        return
+    fi
+
+    if [[ ${PTP_SETUP_CONFIRM:-0} == 1 ]]; then
+        echo
+        if ! ptp_wizard_confirm_start; then
+            return 0
+        fi
+    fi
+
+    ptp_require_root || return
+    mkdir -p "$PTP_RUN_DIR" "$PTP_LOG_DIR"
+    exec 9>"$PTP_RUN_DIR/setup.lock"
+    flock -n 9 || { ptp_die "Another ptpctl setup/stop operation holds the lock" || return; }
+    [[ ! -e $PTP_CURRENT_STATE_FILE ]] || {
+        ptp_die "An active ptpctl state already exists; run './ptpctl status' or 'sudo ./ptpctl stop'" || return
+    }
+
+    local stamp setup_log snapshot runtime_config uds ptp4l_log phc2sys_log phc2sys_presync_log pmc_log desired phc_args
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    setup_log="$PTP_LOG_DIR/setup-$PTP_MODE-$stamp.log"
+    snapshot="$PTP_LOG_DIR/pre-state-$PTP_MODE-$stamp.log"
+    runtime_config="$PTP_RUN_DIR/ptp4l-$PTP_MODE.conf"
+    PTP_RUNTIME_CONFIG="$runtime_config"
+    uds="$PTP_RUN_DIR/ptp4l.sock"
+    ptp4l_log="$PTP_LOG_DIR/ptp4l-$PTP_MODE-$stamp.log"
+    phc2sys_log="$PTP_LOG_DIR/phc2sys-$PTP_MODE-$stamp.log"
+    phc2sys_presync_log="$PTP_LOG_DIR/phc2sys-presync-$PTP_MODE-$stamp.log"
+    pmc_log="$PTP_LOG_DIR/pmc-$PTP_MODE-$stamp.log"
+    exec > >(tee -a "$setup_log") 2>&1
+    PTP_SETUP_TRANSACTION_ACTIVE=1
+    trap 'ptp_setup_signal_rollback INT' INT
+    trap 'ptp_setup_signal_rollback TERM' TERM
+    trap 'ptp_setup_signal_rollback HUP' HUP
+
+    ptp_record_pre_state "$snapshot" || { ptp_setup_fail "Could not record pre-setup state"; return; }
+    ptp_generate_runtime_config "$PTP_ROLE" "$PTP_IFACE" "$runtime_config" "$uds" || {
+        ptp_setup_fail "Could not generate runtime configuration"; return;
+    }
+
+    echo
+    if [[ $PTP_ROLE == master ]]; then
+        echo "Pre-aligning $PTP_PHC from CLOCK_REALTIME before ptp4l advertises time..."
+        PTP_STARTED_PHC2SYS_PID="$(ptp_start_background phc2sys "$phc2sys_presync_log" \
+            phc2sys -s CLOCK_REALTIME -c "$PTP_IFACE" -O "$MASTER_UTC_OFFSET" \
+            -f "$PTPCTL_ROOT/configs/phc2sys.conf" -m)" || {
+            ptp_setup_fail "Master PHC pre-alignment failed to start"; return;
+        }
+        ptp_verify_phc2sys "$PTP_STARTED_PHC2SYS_PID" "$phc2sys_presync_log" "$PHC2SYS_VERIFY_SECONDS" || {
+            ptp_setup_fail "Master PHC pre-alignment produced no valid clock updates"; return;
+        }
+        ptp_ok "PHC pre-alignment is active"
+    fi
+
+    echo "Starting ptp4l..."
+    PTP_STARTED_PTP4L_PID="$(ptp_start_background ptp4l "$ptp4l_log" \
+        ptp4l -f "$runtime_config" -H -i "$PTP_IFACE")" || {
+        ptp_setup_fail "ptp4l failed to start"; return;
+    }
+    desired="$([[ $PTP_ROLE == slave ]] && echo SLAVE || echo MASTER)"
+    if ! ptp_wait_for_port_state "$desired" "$uds" "$([[ $PTP_ROLE == slave ]] && echo "$SYNC_TIMEOUT_SECONDS" || echo "$MASTER_READY_TIMEOUT_SECONDS")" "$pmc_log" >/dev/null; then
+        ptp_setup_fail "ptp4l did not reach $desired. Check link, domain, transport, delay mechanism, profile, and peer/GM availability."; return
+    fi
+    ptp_ok "ptp4l state: $desired"
+
+    if [[ $PTP_ROLE == slave ]]; then
+        ptp_validate_slave_management "$uds" "$pmc_log" || {
+            ptp_setup_fail "Grandmaster management/UTC validation failed; phc2sys was not started"; return;
+        }
+        ptp_ok "Grandmaster PTP timescale and UTC offset are valid"
+        phc_args=(-a -r)
+    else
+        ptp_validate_master_utc "$uds" "$pmc_log" || {
+            ptp_setup_fail "Master TAI-UTC validation failed; phc2sys was not started"; return;
+        }
+        ptp_stop_pid "$PTP_STARTED_PHC2SYS_PID" phc2sys
+        PTP_STARTED_PHC2SYS_PID=""
+        phc_args=(-a -r -r)
+    fi
+
+    echo "Starting phc2sys..."
+    PTP_STARTED_PHC2SYS_PID="$(ptp_start_background phc2sys "$phc2sys_log" \
+        phc2sys "${phc_args[@]}" -f "$PTPCTL_ROOT/configs/phc2sys.conf" \
+        --domainNumber "$PTP_DOMAIN" --transportSpecific "$TRANSPORT_SPECIFIC" -z "$uds" -m)" || {
+        ptp_setup_fail "phc2sys failed to start"; return;
+    }
+    ptp_verify_phc2sys "$PTP_STARTED_PHC2SYS_PID" "$phc2sys_log" "$PHC2SYS_VERIFY_SECONDS" || {
+        ptp_setup_fail "phc2sys did not produce a valid running clock state"; return;
+    }
+    if [[ $PTP_ROLE == slave ]]; then
+        ptp_ok "Final CLOCK_REALTIME synchronization is active and reporting clock updates"
+    else
+        ptp_ok "phc2sys is running and reporting master clock updates"
+    fi
+
+    ptp_write_success_state "$runtime_config" "$uds" "$ptp4l_log" "$phc2sys_log" "$pmc_log" "$setup_log" || {
+        ptp_setup_fail "Could not commit runtime state"; return;
+    }
+    PTP_SETUP_TRANSACTION_ACTIVE=0
+    trap - INT TERM HUP
+    echo
+    if [[ $PTP_ROLE == master && ${PTP_MASTER_SOURCE_STATUS:-} == free-running-lab ]]; then
+        echo "RESULT: READY AS LAB PROTOCOL MASTER (NOT TRACEABLE)"
+    else
+        echo "RESULT: READY"
+    fi
+    echo "Status: $PTPCTL_ROOT/ptpctl status"
+    echo "Stop:   sudo $PTPCTL_ROOT/ptpctl stop"
+}
+
+cmd_status() {
+    ptp_open_command_log status
+    local state=$PTP_CURRENT_STATE_FILE mode role iface phc p1 p2 uds pmc_log current_phc
+    if [[ ! -r $state ]]; then
+        echo "PTP status: STOPPED (no ptpctl runtime state)"
+        ptp_clock_service_report
+        return 0
+    fi
+    mode="$(ptp_read_state_value "$state" MODE || true)"
+    role="$(ptp_read_state_value "$state" ROLE || true)"
+    iface="$(ptp_read_state_value "$state" INTERFACE || true)"
+    phc="$(ptp_read_state_value "$state" PHC || true)"
+    p1="$(ptp_read_state_value "$state" PTP4L_PID || true)"
+    p2="$(ptp_read_state_value "$state" PHC2SYS_PID || true)"
+    uds="$(ptp_read_state_value "$state" UDS || true)"
+    pmc_log="$(ptp_read_state_value "$state" PMC_LOG || true)"
+    echo "PTP status"
+    printf '%-18s %s\n' "Mode:" "$mode"
+    printf '%-18s %s\n' "Interface:" "$iface"
+    printf '%-18s %s\n' "Link:" "$([[ $(ptp_carrier_state "$iface") == 1 ]] && echo UP || echo DOWN)"
+    current_phc="$(ptp_phc_for_iface "$iface" 2>/dev/null || echo unavailable)"
+    printf '%-18s %s (recorded %s)\n' "PHC:" "$current_phc" "$phc"
+    printf '%-18s %s\n' "ptp4l:" "$(kill -0 "$p1" 2>/dev/null && echo "running PID $p1" || echo stopped)"
+    printf '%-18s %s\n' "phc2sys:" "$(kill -0 "$p2" 2>/dev/null && echo "running PID $p2" || echo stopped)"
+    if [[ -S $uds ]]; then
+        echo
+        ptp_pmc_query "$uds" "$pmc_log" 'GET PORT_DATA_SET' || true
+        [[ $role == slave ]] && ptp_pmc_query "$uds" "$pmc_log" 'GET TIME_STATUS_NP' || true
+    else
+        ptp_warn "ptp4l management socket is absent: $uds"
+    fi
+    echo "Raw log: $PTP_COMMAND_LOG"
+}
+
+cmd_stop() {
+    ptp_require_root || return
+    mkdir -p "$PTP_RUN_DIR" "$PTP_LOG_DIR"
+    exec 9>"$PTP_RUN_DIR/setup.lock"
+    flock -n 9 || { ptp_die "Another ptpctl operation holds the lock" || return; }
+    ptp_open_command_log stop
+    local state=$PTP_CURRENT_STATE_FILE p1 p2 config uds
+    if [[ ! -r $state ]]; then
+        echo "Nothing to stop: no ptpctl runtime state exists."
+        return 0
+    fi
+    p1="$(ptp_read_state_value "$state" PTP4L_PID || true)"
+    p2="$(ptp_read_state_value "$state" PHC2SYS_PID || true)"
+    config="$(ptp_read_state_value "$state" RUNTIME_CONFIG || true)"
+    uds="$(ptp_read_state_value "$state" UDS || true)"
+    ptp_stop_pid "$p2" phc2sys
+    ptp_stop_pid "$p1" ptp4l
+    rm -f "$state"
+    [[ -n $config ]] && rm -f "$config"
+    [[ -n $uds ]] && rm -f "$uds" "${uds}ro"
+    ptp_ok "Stopped ptpctl-owned processes and removed transient runtime files"
+    echo "Network links, NIC drivers, clock services, logs, and boot settings were not changed."
+}
+
+main() {
+    local command=${1:-}
+    shift || true
+    case "$command" in
+        "") [[ $# -eq 0 ]] || { usage >&2; return 2; }; cmd_wizard ;;
+        probe) [[ $# -eq 0 ]] || { usage >&2; return 2; }; cmd_probe ;;
+        doctor) [[ $# -eq 0 ]] || { usage >&2; return 2; }; cmd_doctor ;;
+        setup) cmd_setup "$@" ;;
+        status) [[ $# -eq 0 ]] || { usage >&2; return 2; }; cmd_status ;;
+        stop) [[ $# -eq 0 ]] || { usage >&2; return 2; }; cmd_stop ;;
+        -h|--help|help) usage ;;
+        *) usage >&2; return 2 ;;
+    esac
+}
+
+main "$@"

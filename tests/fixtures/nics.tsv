@@ -1,0 +1,3 @@
+# iface family pci model driver firmware link mac phc phc_sysfs tx rx raw valid reason
+mocki350	I350	0000:05:00.0	Intel Corporation I350 Gigabit Network Connection [8086:1521]	igb	1.63	1	02:00:00:00:35:00	/dev/ptp4	/mock/pci/0000:05:00.0/ptp/ptp4	yes	yes	yes	yes	OK
+mockx710	X710	0000:41:00.0	Intel Corporation Ethernet Controller X710 for 10GbE SFP+ [8086:1572]	i40e	9.40	1	02:00:00:00:71:00	/dev/ptp7	/mock/pci/0000:41:00.0/ptp/ptp7	yes	yes	yes	yes	OK

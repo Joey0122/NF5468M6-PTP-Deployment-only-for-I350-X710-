@@ -1,0 +1,23 @@
+# Local site configuration created by the interactive wizard.
+configs/site.env
+
+# Runtime-generated logs, inventory, PID state, configs, and sockets.
+logs/*
+!logs/.gitkeep
+state/*
+!state/.gitkeep
+run/
+*.log
+*.pid
+*.sock
+
+# Local environment, credentials, keys, and editor/OS artifacts.
+.env
+.env.*
+*.pem
+*.key
+.codex/
+.agents/
+.DS_Store
+*~
+*.swp

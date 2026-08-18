@@ -1,0 +1,3 @@
+# Two valid X710 physical ports share one NIC PHC.
+enp65s0f0	X710	0000:41:00.0	Intel Corporation Ethernet Controller X710 [8086:1572]	i40e	9.40	1	02:00:00:00:71:00	/dev/ptp2	/mock/pci/0000:41:00.0/ptp/ptp2	yes	yes	yes	yes	OK
+enp65s0f1	X710	0000:41:00.1	Intel Corporation Ethernet Controller X710 [8086:1572]	i40e	9.40	1	02:00:00:00:71:01	/dev/ptp2	/mock/pci/0000:41:00.0/ptp/ptp2	yes	yes	yes	yes	OK
