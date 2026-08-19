@@ -24,7 +24,9 @@ ptp_dependency_package() {
         lspci) echo pciutils ;;
         ip) echo iproute2 ;;
         ethtool) echo ethtool ;;
-        ptp4l|phc2sys|pmc) echo linuxptp ;;
+        ptp4l|phc2sys|pmc|timemaster) echo linuxptp ;;
+        chronyd|chronyc) echo chrony ;;
+        getent) echo libc-bin ;;
         systemctl|timedatectl) echo systemd ;;
         setsid|flock) echo util-linux ;;
         pgrep) echo procps ;;
@@ -161,7 +163,7 @@ ptp_process_lines() {
 }
 
 ptp_service_active() {
-    systemctl is-active --quiet "$1" 2>/dev/null
+    systemctl is-active --quiet "$1" >/dev/null 2>&1
 }
 
 ptp_clock_service_report() {
@@ -191,6 +193,23 @@ ptp_other_system_discipliner() {
     return 1
 }
 
+ptp_active_clock_service_units() {
+    local service
+    for service in chronyd.service chrony.service; do
+        if ptp_service_active "$service"; then printf '%s\n' "$service"; break; fi
+    done
+    ptp_service_active systemd-timesyncd.service && printf '%s\n' systemd-timesyncd.service
+    for service in ntp.service ntpd.service ntpsec.service openntpd.service; do
+        if ptp_service_active "$service"; then printf '%s\n' "$service"; break; fi
+    done
+}
+
+ptp_active_clock_process_families() {
+    pgrep -x chronyd >/dev/null 2>&1 && echo chrony
+    pgrep -x systemd-timesyncd >/dev/null 2>&1 && echo systemd-timesyncd
+    if pgrep -x 'ntpd|ntpsec|openntpd' >/dev/null 2>&1; then echo ntp; fi
+}
+
 ptp_system_clock_synchronized() {
     local value
     value="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)"
@@ -206,7 +225,7 @@ ptp_atomic_write_state() {
     mkdir -p "$(dirname "$target")"
     temporary="$target.tmp.$$"
     cat > "$temporary"
-    chmod 0600 "$temporary"
+    chmod 0644 "$temporary"
     mv -f "$temporary" "$target"
 }
 

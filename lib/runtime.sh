@@ -2,9 +2,12 @@
 
 PTP_STARTED_PTP4L_PID=""
 PTP_STARTED_PHC2SYS_PID=""
+PTP_STARTED_CHRONYD_PID="${PTP_STARTED_CHRONYD_PID:-}"
 PTP_CURRENT_STATE_FILE="$PTP_RUN_DIR/state.env"
 PTP_RUNTIME_CONFIG=""
 PTP_SETUP_TRANSACTION_ACTIVE=0
+PTP_STOPPED_SERVICES=""
+PTP_CONFLICTING_SERVICES=""
 
 ptp_mode_parse() {
     local mode=$1
@@ -24,7 +27,7 @@ ptp_selected_unpack() {
 }
 
 ptp_print_selection_summary() {
-    echo "PTP Setup Summary"
+    echo "Configuration Summary"
     echo
     printf '%-18s %s\n' "Mode:" "$PTP_MODE"
     printf '%-18s %s\n' "NIC:" "Intel $PTP_FAMILY_SELECTED"
@@ -48,6 +51,7 @@ ptp_print_selection_summary() {
     printf '%-18s %s\n' "transportSpecific:" "$TRANSPORT_SPECIFIC"
     if [[ $PTP_ROLE == slave ]]; then
         printf '%-18s %s\n' "GM discovery:" "$GRANDMASTER_DISCOVERY"
+        printf '%-18s %s\n' "PTP adjusts system:" "$PTP_SLAVE_SYSTEM_CLOCK"
     else
         printf '%-18s %s\n' "Master policy:" "$MASTER_TIME_POLICY"
         printf '%-18s %s\n' "TAI-UTC offset:" "$MASTER_UTC_OFFSET"
@@ -57,7 +61,14 @@ ptp_print_selection_summary() {
         printf '%-18s %s\n' "System time:" "${PTP_MASTER_SOURCE_STATUS:-unknown}"
     fi
     echo
-    printf '%-18s %s\n' "Clock conflicts:" "${PTP_CLOCK_CONFLICTS:-none}"
+    printf '%-18s %s\n' "NTP:" "$([[ $NTP_ENABLED == YES ]] && echo ENABLED || echo DISABLED)"
+    [[ $NTP_ENABLED == YES ]] && printf '%-18s %s\n' "NTP servers:" "$NTP_SERVERS"
+    printf '%-18s %s\n' "NTP mode:" "$(ptp_ntp_mode_display)"
+    echo
+    printf '%-18s %s\n' "CLOCK_REALTIME:" "$(ptp_clock_owner_display)"
+    printf '%-18s %s\n' "NIC PHC:" "$PTP_PHC_OWNER"
+    printf '%-18s %s\n' "Architecture:" "$PTP_ARCHITECTURE"
+    printf '%-18s %s\n' "Clock conflicts:" "${PTP_CLOCK_CONFLICTS:-NONE}"
 }
 
 ptp_generate_runtime_config() {
@@ -106,6 +117,9 @@ ptp_record_pre_state() {
         ip -details link show dev "$PTP_IFACE" 2>&1 || true
         echo
         echo "=== processes ==="
+        ptp_process_lines chronyd
+        ptp_process_lines ntpd
+        ptp_process_lines systemd-timesyncd
         ptp_process_lines ptp4l
         ptp_process_lines phc2sys
     } > "$target"
@@ -131,11 +145,95 @@ ptp_check_existing_ptp_processes() {
     }
 }
 
+ptp_plan_clock_service_conflicts() {
+    local service
+    local -a active=() process_families=()
+    PTP_CONFLICTING_SERVICES=""
+    PTP_CLOCK_CONFLICTS=NONE
+    mapfile -t active < <(ptp_active_clock_service_units)
+
+    # A ptpctl-owned private discipline instance or phc2sys system target needs
+    # exclusive CLOCK_REALTIME ownership. Monitor-only -x also requires existing
+    # normal time services to stop because PTP is the selected owner.
+    if [[ $PTP_CLOCK_OWNER == PHC2SYS || $PTP_CLOCK_OWNER == CHRONYD ]]; then
+        for service in "${active[@]}"; do
+            PTP_CONFLICTING_SERVICES="${PTP_CONFLICTING_SERVICES:+$PTP_CONFLICTING_SERVICES }$service"
+        done
+    else
+        mapfile -t process_families < <(ptp_active_clock_process_families)
+    fi
+    if [[ $PTP_CLOCK_OWNER != PHC2SYS && $PTP_CLOCK_OWNER != CHRONYD ]] &&
+        (( ${#active[@]} > 1 || ${#process_families[@]} > 1 )); then
+        PTP_CLOCK_CONFLICTS="multiple active system time services: ${active[*]}"
+        ptp_error "Multiple active system time controllers already violate the one-owner policy."
+        ptp_error "Services: ${active[*]:-none}; process families: ${process_families[*]:-none}"
+        return 1
+    fi
+
+    if [[ -n $PTP_CONFLICTING_SERVICES ]]; then
+        PTP_CLOCK_CONFLICTS="temporary stop required: $PTP_CONFLICTING_SERVICES"
+        ptp_warn "The selected architecture requires exclusive CLOCK_REALTIME ownership."
+        ptp_warn "Conflicting active services: $PTP_CONFLICTING_SERVICES"
+        if [[ ${PTP_SETUP_MAY_STOP_SERVICES:-0} != 1 ]]; then
+            ptp_error "Run the interactive wizard to approve a temporary stop, or stop the conflict deliberately."
+            return 1
+        fi
+    fi
+
+    # A non-service daemon cannot be restored safely, so never kill it blindly.
+    if [[ -z $PTP_CONFLICTING_SERVICES && ( $PTP_CLOCK_OWNER == PHC2SYS || $PTP_CLOCK_OWNER == CHRONYD ) ]] &&
+        ptp_other_system_discipliner; then
+        PTP_CLOCK_CONFLICTS="unmanaged active system-clock discipliner"
+        ptp_error "A clock-disciplining process is active but is not represented by a manageable active systemd service."
+        ptp_error "ptpctl will not kill an unmanaged process; stop it deliberately and retry."
+        return 1
+    fi
+}
+
+ptp_confirm_temporary_service_stop() {
+    local answer
+    [[ -n $PTP_CONFLICTING_SERVICES ]] || return 0
+    if [[ ${PTPCTL_ASSUME_YES:-0} == 1 ]]; then answer=y
+    else
+        ptp_prompt_read "Temporarily stop $PTP_CONFLICTING_SERVICES and restore on stop/rollback? [y/N] " answer || answer=n
+    fi
+    case ${answer:-n} in y|Y|yes|YES|Yes) ;; *) ptp_error "Setup cancelled; conflicting service was not stopped"; return 1 ;; esac
+    local service
+    for service in $PTP_CONFLICTING_SERVICES; do
+        ptp_service_active "$service" || continue
+        systemctl stop "$service" || {
+            ptp_error "Could not temporarily stop $service"
+            return 1
+        }
+        PTP_STOPPED_SERVICES="${PTP_STOPPED_SERVICES:+$PTP_STOPPED_SERVICES }$service"
+        ptp_ok "Temporarily stopped $service"
+    done
+    ptp_other_system_discipliner && {
+        ptp_error "A competing system-clock discipliner remains active after the approved service stop"
+        return 1
+    }
+}
+
+ptp_restore_stopped_services() {
+    local services=${1:-$PTP_STOPPED_SERVICES} service
+    [[ -n $services ]] || return 0
+    for service in $services; do
+        if ptp_service_active "$service"; then
+            ptp_info "$service is already active; no restore action needed"
+        elif systemctl start "$service"; then
+            ptp_ok "Restored previously active service $service"
+        else
+            ptp_warn "Could not restore previously active service $service; start it manually after reviewing logs"
+        fi
+    done
+}
+
 ptp_check_role_clock_policy() {
     local role=$1
     echo "Checking clock services..."
     ptp_clock_service_report
-    if [[ ${PTPCTL_TEST_MODE:-0} == 1 && ${PTPCTL_TEST_CLOCK_CONFLICT:-0} == 1 && $role == slave ]]; then
+    if [[ ${PTPCTL_TEST_MODE:-0} == 1 && ${PTPCTL_TEST_CLOCK_CONFLICT:-0} == 1 && \
+        ( $PTP_CLOCK_OWNER == PHC2SYS || $PTP_CLOCK_OWNER == CHRONYD ) ]]; then
         PTP_CLOCK_CONFLICTS="active system clock discipliner"
         ptp_error "Slave mode will use phc2sys to discipline CLOCK_REALTIME, but another discipliner is active."
         return 1
@@ -145,16 +243,10 @@ ptp_check_role_clock_policy() {
         ptp_ok "Mock clock policy accepted for dry-run testing"
         return 0
     fi
-    if [[ $role == slave ]]; then
-        if ptp_other_system_discipliner; then
-            PTP_CLOCK_CONFLICTS="active system clock discipliner"
-            ptp_error "Slave mode will use phc2sys to discipline CLOCK_REALTIME, but another discipliner is active."
-            ptp_error "Stop the active service temporarily, for example: sudo systemctl stop chronyd"
-            ptp_error "Do not disable it permanently until the final clock architecture is approved."
-            return 1
-        fi
-        ptp_ok "No competing CLOCK_REALTIME discipliner detected"
-    else
+    if [[ $NTP_ENABLED == YES ]]; then
+        [[ $role == master ]] && PTP_MASTER_SOURCE_STATUS=configured-NTP-pending-validation
+        ptp_ok "Private chronyd will establish the configured NTP policy before dependent PTP startup"
+    elif [[ $role == master ]]; then
         if ptp_system_clock_synchronized; then
             PTP_MASTER_SOURCE_STATUS=synchronized
             ptp_ok "CLOCK_REALTIME reports an upstream synchronization source"
@@ -167,13 +259,19 @@ ptp_check_role_clock_policy() {
             ptp_error "Configure/verify chrony or another upstream source, then rerun doctor and setup."
             return 1
         fi
+    elif [[ $PTP_CLOCK_OWNER == PHC2SYS ]]; then
+        ptp_ok "PTP/phc2sys is the sole planned CLOCK_REALTIME controller"
+    else
+        ptp_ok "PTP PHC-only mode leaves CLOCK_REALTIME and its existing owner unchanged"
     fi
 }
 
 ptp_start_background() {
     local name=$1 log=$2
     shift 2
-    setsid "$@" >> "$log" 2>&1 &
+    # Runtime daemons must not inherit the setup/stop transaction lock; doing
+    # so would make a successful deployment impossible to stop.
+    setsid "$@" 9>&- >> "$log" 2>&1 &
     local pid=$!
     sleep 1
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -187,10 +285,14 @@ ptp_start_background() {
 ptp_pmc_query() {
     local uds=$1 log=$2 command=$3 output
     output="$(pmc -u -b 0 -d "$PTP_DOMAIN" -s "$uds" "$command" 2>&1)" || {
-        printf '%s\n' "$output" >> "$log"
+        if [[ -w $log || ( ! -e $log && -w $(dirname "$log") ) ]]; then
+            printf '%s\n' "$output" >> "$log"
+        fi
         return 1
     }
-    { echo "=== $(date --iso-8601=seconds) $command ==="; printf '%s\n' "$output"; } >> "$log"
+    if [[ -w $log || ( ! -e $log && -w $(dirname "$log") ) ]]; then
+        { echo "=== $(date --iso-8601=seconds) $command ==="; printf '%s\n' "$output"; } >> "$log"
+    fi
     printf '%s\n' "$output"
 }
 
@@ -261,6 +363,10 @@ ptp_verify_phc2sys() {
 ptp_stop_pid() {
     local pid=$1 expected=$2
     [[ $pid =~ ^[0-9]+$ && -d /proc/$pid ]] || return 0
+    if [[ ${PTPCTL_TEST_MODE:-0} == 1 && ${PTPCTL_TEST_RUNTIME_MOCK:-0} == 1 ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        return 0
+    fi
     [[ $(cat "/proc/$pid/comm" 2>/dev/null || true) == "$expected" ]] || {
         ptp_warn "PID $pid is no longer $expected; not signaling it"
         return 0
@@ -275,8 +381,12 @@ ptp_rollback_started() {
     ptp_warn "Setup failed; stopping only processes started by this ptpctl transaction."
     [[ -n $PTP_STARTED_PHC2SYS_PID ]] && ptp_stop_pid "$PTP_STARTED_PHC2SYS_PID" phc2sys
     [[ -n $PTP_STARTED_PTP4L_PID ]] && ptp_stop_pid "$PTP_STARTED_PTP4L_PID" ptp4l
-    rm -f "$PTP_CURRENT_STATE_FILE" "$PTP_RUN_DIR/ptp4l.sock" "$PTP_RUN_DIR/ptp4l.sockro"
+    [[ -n $PTP_STARTED_CHRONYD_PID ]] && ptp_stop_pid "$PTP_STARTED_CHRONYD_PID" chronyd
+    ptp_restore_stopped_services "$PTP_STOPPED_SERVICES"
+    rm -f "$PTP_CURRENT_STATE_FILE" "$PTP_RUN_DIR/ptp4l.sock" "$PTP_RUN_DIR/ptp4l.sockro" \
+        "$PTP_RUN_DIR/chronyd.sock" "$PTP_RUN_DIR/chronyd.pid"
     [[ -n $PTP_RUNTIME_CONFIG ]] && rm -f "$PTP_RUNTIME_CONFIG"
+    [[ -n ${PTP_CHRONY_CONFIG:-} ]] && rm -f "$PTP_CHRONY_CONFIG"
     ptp_info "No network configuration, driver binding, service enablement, or boot setting was changed."
 }
 
@@ -291,9 +401,12 @@ ptp_setup_signal_rollback() {
 
 ptp_write_success_state() {
     local config=$1 uds=$2 ptp4l_log=$3 phc2sys_log=$4 pmc_log=$5 setup_log=$6
+    local chronyd_log=${7:-} ntp_status_log=${8:-}
     ptp_atomic_write_state "$PTP_CURRENT_STATE_FILE" <<EOF
 MODE=$PTP_MODE
 ROLE=$PTP_ROLE
+PTP_DOMAIN=$PTP_DOMAIN
+TRANSPORT_SPECIFIC=$TRANSPORT_SPECIFIC
 FAMILY=$PTP_FAMILY_SELECTED
 INTERFACE=$PTP_IFACE
 PCI=$PTP_PCI
@@ -301,12 +414,26 @@ DRIVER=$PTP_DRIVER
 PHC=$PTP_PHC
 PTP4L_PID=$PTP_STARTED_PTP4L_PID
 PHC2SYS_PID=$PTP_STARTED_PHC2SYS_PID
+CHRONYD_PID=$PTP_STARTED_CHRONYD_PID
 RUNTIME_CONFIG=$config
 UDS=$uds
 PTP4L_LOG=$ptp4l_log
 PHC2SYS_LOG=$phc2sys_log
 PMC_LOG=$pmc_log
 SETUP_LOG=$setup_log
+CHRONY_MODE=$PTP_CHRONY_MODE
+CHRONY_CONFIG=${PTP_CHRONY_CONFIG:-}
+CHRONY_SOCKET=${PTP_CHRONY_SOCKET:-}
+CHRONY_CMD_PORT=${PTP_CHRONY_CMD_PORT:-32322}
+CHRONYD_LOG=$chronyd_log
+NTP_STATUS_LOG=$ntp_status_log
+NTP_ENABLED=$NTP_ENABLED
+NTP_SERVERS=$NTP_SERVERS
+PTP_SLAVE_SYSTEM_CLOCK=$PTP_SLAVE_SYSTEM_CLOCK
+CLOCK_OWNER=$PTP_CLOCK_OWNER
+PHC_OWNER=$PTP_PHC_OWNER
+ARCHITECTURE=$PTP_ARCHITECTURE
+STOPPED_SERVICES=$PTP_STOPPED_SERVICES
 STARTED_AT=$(date --iso-8601=seconds)
 MASTER_SOURCE_STATUS=${PTP_MASTER_SOURCE_STATUS:-external-grandmaster}
 EOF

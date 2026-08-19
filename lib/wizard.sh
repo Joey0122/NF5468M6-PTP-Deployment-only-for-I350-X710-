@@ -165,9 +165,8 @@ ptp_wizard_master_policy() {
     esac
 }
 
-ptp_wizard_site_values() {
+ptp_wizard_load_site_values() {
     local site_file=${PTPCTL_SITE_CONFIG:-$PTPCTL_ROOT/configs/site.env}
-    local default_domain default_transport default_delay default_profile default_ts
     if [[ -r $site_file ]]; then
         echo
         echo "Existing site configuration found: $site_file"
@@ -180,7 +179,57 @@ ptp_wizard_site_values() {
         echo "No existing site configuration was found; the wizard will create $site_file."
         ptp_config_reset
     fi
+}
 
+ptp_wizard_slave_system_clock() {
+    local choice default=1
+    [[ ${PTP_SLAVE_SYSTEM_CLOCK:-YES} == NO ]] && default=2
+    echo
+    echo "Should PTP modify the Linux system clock?"
+    echo
+    echo "[1] Yes — synchronize CLOCK_REALTIME from PTP"
+    echo "[2] No  — synchronize only the NIC PHC"
+    echo
+    ptp_wizard_menu_choice choice "$default" 2 || return
+    case $choice in 1) PTP_SLAVE_SYSTEM_CLOCK=YES ;; 2) PTP_SLAVE_SYSTEM_CLOCK=NO ;; esac
+}
+
+ptp_wizard_ntp() {
+    local choice default=1 answer default_servers=""
+    [[ ${NTP_ENABLED:-NO} == YES ]] && default=2
+    echo
+    echo "Configure NTP connection?"
+    echo
+    echo "[1] No NTP"
+    echo "[2] Yes — NTP client"
+    echo
+    ptp_wizard_menu_choice choice "$default" 2 || return
+    if [[ $choice == 1 ]]; then
+        NTP_ENABLED=NO
+        # Retain a previously validated server list as a future wizard default;
+        # it is inert while NTP_ENABLED=NO.
+        return
+    fi
+
+    NTP_ENABLED=YES
+    default_servers=${NTP_SERVERS:-}
+    while true; do
+        ptp_prompt_read "NTP server hostname/IP${default_servers:+ [$default_servers]}: " answer || {
+            ptp_error "Input ended; setup was cancelled."
+            return 1
+        }
+        answer=${answer:-$default_servers}
+        if ptp_validate_ntp_servers "$answer"; then
+            NTP_SERVERS=$answer
+            return 0
+        fi
+        echo "Enter one or more NTP hostnames/IPs separated by spaces or commas."
+    done
+}
+
+ptp_wizard_site_values() {
+    local site_file=${PTPCTL_SITE_CONFIG:-$PTPCTL_ROOT/configs/site.env}
+    local default_domain default_transport default_delay default_profile default_ts
     default_domain=$([[ ${PTP_DOMAIN:-TODO} =~ ^[0-9]+$ ]] && echo "$PTP_DOMAIN" || echo 0)
     default_transport=$([[ ${PTP_TRANSPORT:-} =~ ^(L2|UDPv4|UDPv6)$ ]] && echo "$PTP_TRANSPORT" || echo L2)
     default_delay=$([[ ${PTP_DELAY_MECHANISM:-} =~ ^(E2E|P2P|Auto)$ ]] && echo "$PTP_DELAY_MECHANISM" || echo E2E)
@@ -208,7 +257,13 @@ ptp_wizard_site_values() {
         SLAVE_CLOCK_POLICY=REQUIRE_NO_OTHER_DISCIPLINER
         SLAVE_TAI_UTC_POLICY=REQUIRE_VALID_GM
     else
-        ptp_wizard_master_policy || return
+        if [[ $NTP_ENABLED == YES ]]; then
+            MASTER_TIME_POLICY=REQUIRE_SYNCED_SYSTEM
+            echo
+            echo "Master upstream-time policy: configured NTP must synchronize before PTP MASTER starts."
+        else
+            ptp_wizard_master_policy || return
+        fi
         local offset_default="" authority_default=""
         [[ ${MASTER_UTC_OFFSET:-} =~ ^[0-9]+$ ]] && offset_default=$MASTER_UTC_OFFSET
         ! ptp_is_todo "${MASTER_UTC_OFFSET_AUTHORITY:-}" && authority_default=$MASTER_UTC_OFFSET_AUTHORITY
@@ -257,15 +312,15 @@ ptp_wizard_mode() {
 ptp_wizard_confirm_start() {
     local answer
     while true; do
-        ptp_prompt_read "Start PTP synchronization now? [Y/n] " answer || {
+        ptp_prompt_read "Start synchronization? [Y/n] " answer || {
             echo
-            echo "Setup cancelled before start; no PTP process was started."
+            echo "Setup cancelled before start; no PTP or NTP process was started."
             return 1
         }
         case ${answer:-Y} in
             y|Y|yes|YES|Yes) return 0 ;;
             n|N|no|NO|No)
-                echo "Setup cancelled before start; no PTP process was started."
+                echo "Setup cancelled before start; no PTP or NTP process was started."
                 return 1
                 ;;
             *) echo "Enter y or n." ;;
@@ -276,7 +331,7 @@ ptp_wizard_confirm_start() {
 cmd_wizard() {
     local inventory_file="$PTP_STATE_DIR/server_inventory.txt" record
     unset PTP_REQUESTED_PCI
-    echo "PTP Interactive Setup Wizard"
+    echo "NF5468M6 Time Synchronization Setup"
     echo
     ptp_require_linux || return
     ptp_require_commands lspci ip ethtool ptp4l phc2sys pmc systemctl timedatectl setsid flock pgrep || return
@@ -303,10 +358,16 @@ cmd_wizard() {
     ptp_validate_selected_candidate "$PTP_SELECTED_CANDIDATE" yes || return
     ptp_selected_unpack
     PTP_REQUESTED_PCI=$PTP_PCI
+    ptp_wizard_load_site_values || return
+    if [[ $PTP_ROLE == slave ]]; then
+        ptp_wizard_slave_system_clock || return
+    fi
+    ptp_wizard_ntp || return
+    [[ $NTP_ENABLED == NO ]] || ptp_require_commands chronyd chronyc getent || return
     ptp_wizard_site_values || return
 
     # cmd_setup repeats dependency, PCI/netdev, timestamp, PHC, link, process,
     # and clock-policy checks. The remembered PCI function only identifies the
     # user's menu choice; no cached interface or PHC value is trusted.
-    PTP_SETUP_CONFIRM=1 cmd_setup "$PTP_MODE"
+    PTP_SETUP_CONFIRM=1 PTP_SETUP_MAY_STOP_SERVICES=1 cmd_setup "$PTP_MODE"
 }

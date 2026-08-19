@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 
 ptp_config_reset() {
+    # Backward-compatible safe defaults preserve the former PTP-only slave
+    # behaviour when an older site.env has not yet been rewritten by the wizard.
+    NTP_ENABLED=NO
+    NTP_SERVERS=""
+    PTP_SLAVE_SYSTEM_CLOCK=YES
     PTP_DOMAIN=TODO
     PTP_TRANSPORT=TODO
     PTP_DELAY_MECHANISM=TODO
@@ -16,16 +21,20 @@ ptp_config_reset() {
     SYNC_TIMEOUT_SECONDS=120
     MASTER_READY_TIMEOUT_SECONDS=30
     PHC2SYS_VERIFY_SECONDS=8
+    NTP_PROBE_TIMEOUT_SECONDS=10
+    NTP_SYNC_TIMEOUT_SECONDS=60
 }
 
 ptp_config_reset
 
 ptp_config_known_key() {
     case "$1" in
+        NTP_ENABLED|NTP_SERVERS|PTP_SLAVE_SYSTEM_CLOCK|\
         PTP_DOMAIN|PTP_TRANSPORT|PTP_DELAY_MECHANISM|PTP_PROFILE|TRANSPORT_SPECIFIC|\
         GRANDMASTER_DISCOVERY|PROFILE_EXTRA_CONFIG|SLAVE_CLOCK_POLICY|\
         SLAVE_TAI_UTC_POLICY|MASTER_TIME_POLICY|MASTER_UTC_OFFSET|MASTER_UTC_OFFSET_AUTHORITY|\
-        SYNC_TIMEOUT_SECONDS|MASTER_READY_TIMEOUT_SECONDS|PHC2SYS_VERIFY_SECONDS) return 0 ;;
+        SYNC_TIMEOUT_SECONDS|MASTER_READY_TIMEOUT_SECONDS|PHC2SYS_VERIFY_SECONDS|\
+        NTP_PROBE_TIMEOUT_SECONDS|NTP_SYNC_TIMEOUT_SECONDS) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -62,9 +71,14 @@ ptp_write_site_config() {
     temporary="$file.tmp.$$"
     {
         cat <<EOF
-# Site-owned PTP values. The interactive wizard maintains this file.
+# Site-owned PTP and NTP values. The interactive wizard maintains this file.
 # Hardware interface, PCI, driver, and /dev/ptp values never belong here:
 # ptpctl discovers and validates them live on every setup run.
+
+# NTP and slave system-clock ownership policy.
+NTP_ENABLED=$NTP_ENABLED
+NTP_SERVERS=$NTP_SERVERS
+PTP_SLAVE_SYSTEM_CLOCK=$PTP_SLAVE_SYSTEM_CLOCK
 
 # Common PTP network/profile values supplied by the experiment or network owner.
 # PTP_DOMAIN is 0..255. Transport is L2, UDPv4, or UDPv6.
@@ -95,6 +109,8 @@ PROFILE_EXTRA_CONFIG=$PROFILE_EXTRA_CONFIG
 SYNC_TIMEOUT_SECONDS=$SYNC_TIMEOUT_SECONDS
 MASTER_READY_TIMEOUT_SECONDS=$MASTER_READY_TIMEOUT_SECONDS
 PHC2SYS_VERIFY_SECONDS=$PHC2SYS_VERIFY_SECONDS
+NTP_PROBE_TIMEOUT_SECONDS=$NTP_PROBE_TIMEOUT_SECONDS
+NTP_SYNC_TIMEOUT_SECONDS=$NTP_SYNC_TIMEOUT_SECONDS
 EOF
     } > "$temporary" || { rm -f "$temporary"; return 1; }
     chmod 0644 "$temporary"
@@ -115,6 +131,14 @@ ptp_config_require_common() {
     [[ $SYNC_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] || ptp_die "SYNC_TIMEOUT_SECONDS must be positive" || return
     [[ $MASTER_READY_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] || ptp_die "MASTER_READY_TIMEOUT_SECONDS must be positive" || return
     [[ $PHC2SYS_VERIFY_SECONDS =~ ^[1-9][0-9]*$ ]] || ptp_die "PHC2SYS_VERIFY_SECONDS must be positive" || return
+    [[ $NTP_PROBE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] || ptp_die "NTP_PROBE_TIMEOUT_SECONDS must be positive" || return
+    [[ $NTP_SYNC_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] || ptp_die "NTP_SYNC_TIMEOUT_SECONDS must be positive" || return
+    [[ $NTP_ENABLED == YES || $NTP_ENABLED == NO ]] || ptp_die "NTP_ENABLED must be YES or NO" || return
+    if [[ $NTP_ENABLED == YES ]]; then
+        ptp_validate_ntp_servers "$NTP_SERVERS" || return
+    elif [[ -n $NTP_SERVERS ]]; then
+        ptp_validate_ntp_servers "$NTP_SERVERS" || return
+    fi
 
     if [[ $PTP_PROFILE != IEEE1588_DEFAULT ]]; then
         [[ $PROFILE_EXTRA_CONFIG != NONE && -r $PROFILE_EXTRA_CONFIG ]] || {
@@ -128,6 +152,8 @@ ptp_config_require_role() {
     ptp_config_require_common || return
     case "$role" in
         slave)
+            [[ $PTP_SLAVE_SYSTEM_CLOCK == YES || $PTP_SLAVE_SYSTEM_CLOCK == NO ]] ||
+                { ptp_die "PTP_SLAVE_SYSTEM_CLOCK must be YES or NO" || return; }
             ptp_is_todo "$GRANDMASTER_DISCOVERY" && { ptp_die "GRANDMASTER_DISCOVERY is TODO" || return; }
             [[ $GRANDMASTER_DISCOVERY == MULTICAST || $GRANDMASTER_DISCOVERY == UNICAST_CONFIGURED ]] ||
                 { ptp_die "GRANDMASTER_DISCOVERY must be MULTICAST or UNICAST_CONFIGURED" || return; }

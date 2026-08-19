@@ -9,6 +9,10 @@ source "$PTPCTL_ROOT/lib/ptp_common.sh"
 source "$PTPCTL_ROOT/lib/config.sh"
 # shellcheck source=lib/discovery.sh
 source "$PTPCTL_ROOT/lib/discovery.sh"
+# shellcheck source=lib/clock_policy.sh
+source "$PTPCTL_ROOT/lib/clock_policy.sh"
+# shellcheck source=lib/ntp.sh
+source "$PTPCTL_ROOT/lib/ntp.sh"
 # shellcheck source=lib/runtime.sh
 source "$PTPCTL_ROOT/lib/runtime.sh"
 # shellcheck source=lib/wizard.sh
@@ -22,16 +26,22 @@ Usage:
   ./ptpctl doctor
   ./ptpctl status
   sudo ./ptpctl stop
-  sudo ./ptpctl setup I350-master [--dry-run]
-  sudo ./ptpctl setup I350-slave  [--dry-run]
-  sudo ./ptpctl setup X710-master [--dry-run]
-  sudo ./ptpctl setup X710-slave  [--dry-run]
+  sudo ./ptpctl setup I350-master [OPTIONS]
+  sudo ./ptpctl setup I350-slave  [OPTIONS]
+  sudo ./ptpctl setup X710-master [OPTIONS]
+  sudo ./ptpctl setup X710-slave  [OPTIONS]
+
+Setup options:
+  --dry-run
+  --ptp-system-clock=yes|no
+  --ntp=off
+  --ntp-server=HOST_OR_IP       May be repeated
 
 Dry-run performs discovery, selection, validation, config rendering, clock
 policy checks, and command planning without starting or stopping a process.
 
-With no arguments, ptpctl runs the interactive setup wizard, discovers all
-Linux hardware values, and asks only for site-owned PTP settings.
+With no arguments, ptpctl runs the interactive PTP + NTP setup wizard,
+discovers all Linux hardware values, and asks only for site-owned settings.
 EOF
 }
 
@@ -82,16 +92,24 @@ cmd_doctor() {
     echo
     if ptp_load_site_config; then
         echo "Site configuration: $PTPCTL_ROOT/configs/site.env"
-        for key in PTP_DOMAIN PTP_TRANSPORT PTP_DELAY_MECHANISM PTP_PROFILE TRANSPORT_SPECIFIC \
+        for key in NTP_ENABLED PTP_SLAVE_SYSTEM_CLOCK \
+            PTP_DOMAIN PTP_TRANSPORT PTP_DELAY_MECHANISM PTP_PROFILE TRANSPORT_SPECIFIC \
             GRANDMASTER_DISCOVERY SLAVE_CLOCK_POLICY SLAVE_TAI_UTC_POLICY MASTER_TIME_POLICY MASTER_UTC_OFFSET \
             MASTER_UTC_OFFSET_AUTHORITY; do
             value=${!key}
             printf '  %-28s %s\n' "$key" "$value"
             ptp_is_todo "$value" && problems=1
         done
+        printf '  %-28s %s\n' "NTP_SERVERS" "${NTP_SERVERS:-none}"
+        [[ $NTP_ENABLED == YES && -z $NTP_SERVERS ]] && problems=1
+        if [[ $NTP_ENABLED == YES ]]; then
+            ptp_require_commands chronyd chronyc getent || problems=1
+        fi
     else
         problems=1
     fi
+    echo
+    printf '%-28s %s\n' "timemaster:" "$(command -v timemaster >/dev/null 2>&1 && echo available || echo not-installed)"
     echo
     ptp_probe_report || problems=1
     [[ ${#PTP_CANDIDATES[@]} -gt 0 ]] || problems=1
@@ -112,7 +130,7 @@ cmd_doctor() {
 }
 
 ptp_dry_run_plan() {
-    local temp_config uds="$PTP_RUN_DIR/ptp4l.sock"
+    local temp_config temp_chrony="" uds="$PTP_RUN_DIR/ptp4l.sock"
     temp_config="$(mktemp)" || return
     if ! ptp_generate_runtime_config "$PTP_ROLE" "$PTP_IFACE" "$temp_config" "$uds"; then
         rm -f "$temp_config"; return 1
@@ -122,16 +140,34 @@ ptp_dry_run_plan() {
     sed -n '1,260p' "$temp_config"
     echo
     echo "=== DRY RUN: process plan ==="
+    if [[ $PTP_CHRONY_MODE != OFF ]]; then
+        temp_chrony="$(mktemp)" || { rm -f "$temp_config"; return; }
+        ptp_generate_chrony_config "$temp_chrony" || { rm -f "$temp_config" "$temp_chrony"; return; }
+        echo "=== DRY RUN: generated private chrony configuration ==="
+        sed -n '1,200p' "$temp_chrony"
+        echo
+        echo "validate private chrony configuration and probe configured NTP sources without setting the clock"
+        if [[ $PTP_CHRONY_MODE == MONITOR_ONLY ]]; then
+            echo "chronyd -d -x -f <private-chrony-config>  # monitor only; cannot adjust CLOCK_REALTIME"
+        else
+            echo "chronyd -d -f <private-chrony-config>     # sole CLOCK_REALTIME owner"
+        fi
+        echo "wait for a selected, usable NTP source"
+    fi
     echo "ptp4l -f <runtime-config> -H -i $PTP_IFACE"
     if [[ $PTP_ROLE == slave ]]; then
         echo "wait for pmc PORT_DATA_SET state SLAVE"
-        echo "verify TIME_PROPERTIES_DATA_SET: ptpTimescale=1 and currentUtcOffsetValid=1"
-        echo "phc2sys -a -r -f configs/phc2sys.conf --domainNumber $PTP_DOMAIN --transportSpecific $TRANSPORT_SPECIFIC -z <ptp4l-uds>"
+        if [[ $PTP_SLAVE_SYSTEM_CLOCK == YES ]]; then
+            echo "verify TIME_PROPERTIES_DATA_SET: ptpTimescale=1, numeric currentUtcOffset, and currentUtcOffsetValid=1"
+            echo "phc2sys -a -r -f configs/phc2sys.conf --domainNumber $PTP_DOMAIN --transportSpecific $TRANSPORT_SPECIFIC -z <ptp4l-uds>"
+        else
+            echo "PHC-only mode: do not start phc2sys with CLOCK_REALTIME as a target"
+        fi
     else
         echo "pre-align PHC: phc2sys -s CLOCK_REALTIME -c $PTP_IFACE -O $MASTER_UTC_OFFSET"
         echo "start ptp4l only after PHC pre-alignment is producing valid samples"
         echo "wait for pmc PORT_DATA_SET state MASTER"
-        echo "phc2sys -a -r -r -f configs/phc2sys.conf --domainNumber $PTP_DOMAIN --transportSpecific $TRANSPORT_SPECIFIC -z <ptp4l-uds>"
+        echo "continue explicit CLOCK_REALTIME -> NIC PHC synchronization; CLOCK_REALTIME is never a phc2sys target"
         if [[ $MASTER_TIME_POLICY == ALLOW_LAB_FREERUN ]]; then
             echo "LAB WARNING: protocol master only; system time is not required to be traceable"
         fi
@@ -139,6 +175,8 @@ ptp_dry_run_plan() {
     echo
     echo "No process, clock, link, service, runtime state, or persistent configuration was changed."
     rm -f "$temp_config"
+    [[ -n $temp_chrony ]] && rm -f "$temp_chrony"
+    return 0
 }
 
 ptp_setup_fail() {
@@ -149,23 +187,46 @@ ptp_setup_fail() {
 }
 
 cmd_setup() {
-    local mode=${1:-} dry_run=0 arg
+    local mode=${1:-} dry_run=0 arg override_ptp_system="" override_ntp_off=0
+    local override_ntp_servers=""
     shift || true
     for arg in "$@"; do
-        case "$arg" in --dry-run) dry_run=1 ;; *) ptp_die "Unknown setup option: $arg" || return ;; esac
+        case "$arg" in
+            --dry-run) dry_run=1 ;;
+            --ptp-system-clock=yes) override_ptp_system=YES ;;
+            --ptp-system-clock=no) override_ptp_system=NO ;;
+            --ntp=off) override_ntp_off=1 ;;
+            --ntp-server=*)
+                [[ -n ${arg#*=} ]] || { ptp_die "--ntp-server requires a hostname or IP" || return; }
+                override_ntp_servers="${override_ntp_servers:+$override_ntp_servers }${arg#*=}"
+                ;;
+            *) ptp_die "Unknown setup option: $arg" || return ;;
+        esac
     done
     [[ -n $mode ]] || { ptp_die "setup requires one of four modes" || true; usage >&2; return 2; }
     ptp_mode_parse "$mode" || return
     ptp_load_site_config || return
+    if [[ $PTP_ROLE == master && -n $override_ptp_system ]]; then
+        ptp_die "--ptp-system-clock applies only to PTP slave modes" || return
+    fi
+    [[ -n $override_ptp_system ]] && PTP_SLAVE_SYSTEM_CLOCK=$override_ptp_system
+    if (( override_ntp_off == 1 )); then NTP_ENABLED=NO; NTP_SERVERS=""; fi
+    if [[ -n $override_ntp_servers ]]; then NTP_ENABLED=YES; NTP_SERVERS=$override_ntp_servers; fi
+    [[ $PTP_ROLE == master && $NTP_ENABLED == YES ]] && MASTER_TIME_POLICY=REQUIRE_SYNCED_SYSTEM
     ptp_config_require_role "$PTP_ROLE" || return
     ptp_validate_profile_extra || return
+    ptp_derive_clock_policy "$PTP_ROLE" || return
     ptp_require_linux || return
     ptp_require_commands lspci ip ethtool ptp4l phc2sys pmc systemctl timedatectl setsid flock pgrep || return
+    if [[ $NTP_ENABLED == YES ]]; then
+        ptp_require_commands chronyd chronyc getent || return
+    fi
     ptp_discover_candidates || return
     ptp_select_candidate "$PTP_FAMILY" || return
     ptp_validate_selected_candidate "$PTP_SELECTED_CANDIDATE" yes || return
     ptp_selected_unpack
     ptp_check_existing_ptp_processes || return
+    ptp_plan_clock_service_conflicts || return
     ptp_check_role_clock_policy "$PTP_ROLE" || return
     echo
     ptp_print_selection_summary
@@ -184,23 +245,27 @@ cmd_setup() {
 
     ptp_require_root || return
     mkdir -p "$PTP_RUN_DIR" "$PTP_LOG_DIR"
+    chmod 0755 "$PTP_RUN_DIR"
     exec 9>"$PTP_RUN_DIR/setup.lock"
     flock -n 9 || { ptp_die "Another ptpctl setup/stop operation holds the lock" || return; }
     [[ ! -e $PTP_CURRENT_STATE_FILE ]] || {
         ptp_die "An active ptpctl state already exists; run './ptpctl status' or 'sudo ./ptpctl stop'" || return
     }
 
-    local stamp setup_log snapshot runtime_config uds ptp4l_log phc2sys_log phc2sys_presync_log pmc_log desired phc_args
+    local stamp setup_log snapshot runtime_config chrony_config uds ptp4l_log phc2sys_log pmc_log
+    local chronyd_log ntp_status_log desired
     stamp="$(date +%Y%m%d-%H%M%S)"
     setup_log="$PTP_LOG_DIR/setup-$PTP_MODE-$stamp.log"
     snapshot="$PTP_LOG_DIR/pre-state-$PTP_MODE-$stamp.log"
     runtime_config="$PTP_RUN_DIR/ptp4l-$PTP_MODE.conf"
+    chrony_config="$PTP_RUN_DIR/chrony.conf"
     PTP_RUNTIME_CONFIG="$runtime_config"
     uds="$PTP_RUN_DIR/ptp4l.sock"
     ptp4l_log="$PTP_LOG_DIR/ptp4l-$PTP_MODE-$stamp.log"
     phc2sys_log="$PTP_LOG_DIR/phc2sys-$PTP_MODE-$stamp.log"
-    phc2sys_presync_log="$PTP_LOG_DIR/phc2sys-presync-$PTP_MODE-$stamp.log"
     pmc_log="$PTP_LOG_DIR/pmc-$PTP_MODE-$stamp.log"
+    chronyd_log="$PTP_LOG_DIR/chronyd-$PTP_MODE-$stamp.log"
+    ntp_status_log="$PTP_LOG_DIR/ntp-status-$PTP_MODE-$stamp.log"
     exec > >(tee -a "$setup_log") 2>&1
     PTP_SETUP_TRANSACTION_ACTIVE=1
     trap 'ptp_setup_signal_rollback INT' INT
@@ -212,18 +277,46 @@ cmd_setup() {
         ptp_setup_fail "Could not generate runtime configuration"; return;
     }
 
+    if [[ $PTP_CHRONY_MODE != OFF ]]; then
+        ptp_generate_chrony_config "$chrony_config" || {
+            ptp_setup_fail "Could not generate private chrony configuration"; return;
+        }
+        ptp_validate_ntp_names || {
+            ptp_setup_fail "NTP server name/address validation failed"; return;
+        }
+        ptp_validate_chrony_config "$chrony_config" "$ntp_status_log" || {
+            ptp_setup_fail "Private chrony configuration validation failed"; return;
+        }
+        ptp_probe_ntp_sources "$chrony_config" "$ntp_status_log" || {
+            ptp_setup_fail "NTP reachability validation failed before startup"; return;
+        }
+    fi
+
+    ptp_confirm_temporary_service_stop || {
+        ptp_setup_fail "Required clock-service conflict was not resolved"; return;
+    }
+
+    if [[ $PTP_CHRONY_MODE != OFF ]]; then
+        echo
+        echo "Starting private chronyd in $PTP_CHRONY_MODE mode..."
+        ptp_start_private_chronyd "$chrony_config" "$chronyd_log" "$ntp_status_log" || {
+            ptp_setup_fail "Private chronyd did not establish a usable NTP source"; return;
+        }
+        [[ $PTP_CHRONY_MODE == DISCIPLINE ]] && PTP_MASTER_SOURCE_STATUS=ntp-backed
+    fi
+
     echo
     if [[ $PTP_ROLE == master ]]; then
         echo "Pre-aligning $PTP_PHC from CLOCK_REALTIME before ptp4l advertises time..."
-        PTP_STARTED_PHC2SYS_PID="$(ptp_start_background phc2sys "$phc2sys_presync_log" \
+        PTP_STARTED_PHC2SYS_PID="$(ptp_start_background phc2sys "$phc2sys_log" \
             phc2sys -s CLOCK_REALTIME -c "$PTP_IFACE" -O "$MASTER_UTC_OFFSET" \
             -f "$PTPCTL_ROOT/configs/phc2sys.conf" -m)" || {
             ptp_setup_fail "Master PHC pre-alignment failed to start"; return;
         }
-        ptp_verify_phc2sys "$PTP_STARTED_PHC2SYS_PID" "$phc2sys_presync_log" "$PHC2SYS_VERIFY_SECONDS" || {
+        ptp_verify_phc2sys "$PTP_STARTED_PHC2SYS_PID" "$phc2sys_log" "$PHC2SYS_VERIFY_SECONDS" || {
             ptp_setup_fail "Master PHC pre-alignment produced no valid clock updates"; return;
         }
-        ptp_ok "PHC pre-alignment is active"
+        ptp_ok "PHC pre-alignment is active and will continue with CLOCK_REALTIME as the explicit source"
     fi
 
     echo "Starting ptp4l..."
@@ -238,42 +331,43 @@ cmd_setup() {
     ptp_ok "ptp4l state: $desired"
 
     if [[ $PTP_ROLE == slave ]]; then
-        ptp_validate_slave_management "$uds" "$pmc_log" || {
-            ptp_setup_fail "Grandmaster management/UTC validation failed; phc2sys was not started"; return;
-        }
-        ptp_ok "Grandmaster PTP timescale and UTC offset are valid"
-        phc_args=(-a -r)
+        if [[ $PTP_SLAVE_SYSTEM_CLOCK == YES ]]; then
+            ptp_validate_slave_management "$uds" "$pmc_log" || {
+                ptp_setup_fail "Grandmaster management/UTC validation failed; phc2sys was not started"; return;
+            }
+            ptp_ok "Grandmaster PTP timescale and UTC offset are valid"
+            echo "Starting phc2sys as the sole CLOCK_REALTIME controller..."
+            PTP_STARTED_PHC2SYS_PID="$(ptp_start_background phc2sys "$phc2sys_log" \
+                phc2sys -a -r -f "$PTPCTL_ROOT/configs/phc2sys.conf" \
+                --domainNumber "$PTP_DOMAIN" --transportSpecific "$TRANSPORT_SPECIFIC" -z "$uds" -m)" || {
+                ptp_setup_fail "phc2sys failed to start"; return;
+            }
+            ptp_verify_phc2sys "$PTP_STARTED_PHC2SYS_PID" "$phc2sys_log" "$PHC2SYS_VERIFY_SECONDS" || {
+                ptp_setup_fail "phc2sys did not produce a valid running clock state"; return;
+            }
+            ptp_ok "CLOCK_REALTIME synchronization from PTP is active"
+        else
+            PTP_STARTED_PHC2SYS_PID=""
+            ptp_ok "PTP PHC-only mode is active; no phc2sys process can modify CLOCK_REALTIME"
+        fi
     else
         ptp_validate_master_utc "$uds" "$pmc_log" || {
-            ptp_setup_fail "Master TAI-UTC validation failed; phc2sys was not started"; return;
+            ptp_setup_fail "Master TAI-UTC validation failed"; return;
         }
-        ptp_stop_pid "$PTP_STARTED_PHC2SYS_PID" phc2sys
-        PTP_STARTED_PHC2SYS_PID=""
-        phc_args=(-a -r -r)
+        ptp_ok "PTP MASTER is advertising the continuously NTP/system-aligned NIC PHC"
     fi
 
-    echo "Starting phc2sys..."
-    PTP_STARTED_PHC2SYS_PID="$(ptp_start_background phc2sys "$phc2sys_log" \
-        phc2sys "${phc_args[@]}" -f "$PTPCTL_ROOT/configs/phc2sys.conf" \
-        --domainNumber "$PTP_DOMAIN" --transportSpecific "$TRANSPORT_SPECIFIC" -z "$uds" -m)" || {
-        ptp_setup_fail "phc2sys failed to start"; return;
-    }
-    ptp_verify_phc2sys "$PTP_STARTED_PHC2SYS_PID" "$phc2sys_log" "$PHC2SYS_VERIFY_SECONDS" || {
-        ptp_setup_fail "phc2sys did not produce a valid running clock state"; return;
-    }
-    if [[ $PTP_ROLE == slave ]]; then
-        ptp_ok "Final CLOCK_REALTIME synchronization is active and reporting clock updates"
-    else
-        ptp_ok "phc2sys is running and reporting master clock updates"
-    fi
-
-    ptp_write_success_state "$runtime_config" "$uds" "$ptp4l_log" "$phc2sys_log" "$pmc_log" "$setup_log" || {
+    ptp_assert_single_clock_owner || { ptp_setup_fail "Final clock-owner invariant failed"; return; }
+    ptp_write_success_state "$runtime_config" "$uds" "$ptp4l_log" "$phc2sys_log" "$pmc_log" "$setup_log" \
+        "$chronyd_log" "$ntp_status_log" || {
         ptp_setup_fail "Could not commit runtime state"; return;
     }
     PTP_SETUP_TRANSACTION_ACTIVE=0
     trap - INT TERM HUP
     echo
-    if [[ $PTP_ROLE == master && ${PTP_MASTER_SOURCE_STATUS:-} == free-running-lab ]]; then
+    if [[ $PTP_ROLE == master && $NTP_ENABLED == YES ]]; then
+        echo "RESULT: READY — NTP-BACKED PTP MASTER"
+    elif [[ $PTP_ROLE == master && ${PTP_MASTER_SOURCE_STATUS:-} == free-running-lab ]]; then
         echo "RESULT: READY AS LAB PROTOCOL MASTER (NOT TRACEABLE)"
     else
         echo "RESULT: READY"
@@ -284,35 +378,97 @@ cmd_setup() {
 
 cmd_status() {
     ptp_open_command_log status
-    local state=$PTP_CURRENT_STATE_FILE mode role iface phc p1 p2 uds pmc_log current_phc
+    local state=$PTP_CURRENT_STATE_FILE mode role iface family phc p1 p2 p3 uds pmc_log current_phc
+    local ntp_enabled ntp_servers chrony_mode chrony_socket ntp_status_log clock_owner phc_owner
+    local port_output current_output port_state master_offset path_delay conflict active_services cmdline
     if [[ ! -r $state ]]; then
-        echo "PTP status: STOPPED (no ptpctl runtime state)"
+        echo "Time synchronization status: STOPPED (no ptpctl runtime state)"
         ptp_clock_service_report
         return 0
     fi
     mode="$(ptp_read_state_value "$state" MODE || true)"
     role="$(ptp_read_state_value "$state" ROLE || true)"
+    family="$(ptp_read_state_value "$state" FAMILY || true)"
     iface="$(ptp_read_state_value "$state" INTERFACE || true)"
     phc="$(ptp_read_state_value "$state" PHC || true)"
     p1="$(ptp_read_state_value "$state" PTP4L_PID || true)"
     p2="$(ptp_read_state_value "$state" PHC2SYS_PID || true)"
+    p3="$(ptp_read_state_value "$state" CHRONYD_PID || true)"
     uds="$(ptp_read_state_value "$state" UDS || true)"
     pmc_log="$(ptp_read_state_value "$state" PMC_LOG || true)"
-    echo "PTP status"
-    printf '%-18s %s\n' "Mode:" "$mode"
-    printf '%-18s %s\n' "Interface:" "$iface"
-    printf '%-18s %s\n' "Link:" "$([[ $(ptp_carrier_state "$iface") == 1 ]] && echo UP || echo DOWN)"
-    current_phc="$(ptp_phc_for_iface "$iface" 2>/dev/null || echo unavailable)"
-    printf '%-18s %s (recorded %s)\n' "PHC:" "$current_phc" "$phc"
-    printf '%-18s %s\n' "ptp4l:" "$(kill -0 "$p1" 2>/dev/null && echo "running PID $p1" || echo stopped)"
-    printf '%-18s %s\n' "phc2sys:" "$(kill -0 "$p2" 2>/dev/null && echo "running PID $p2" || echo stopped)"
-    if [[ -S $uds ]]; then
-        echo
-        ptp_pmc_query "$uds" "$pmc_log" 'GET PORT_DATA_SET' || true
-        [[ $role == slave ]] && ptp_pmc_query "$uds" "$pmc_log" 'GET TIME_STATUS_NP' || true
-    else
-        ptp_warn "ptp4l management socket is absent: $uds"
+    PTP_DOMAIN="$(ptp_read_state_value "$state" PTP_DOMAIN || echo 0)"
+    ntp_enabled="$(ptp_read_state_value "$state" NTP_ENABLED || echo NO)"
+    ntp_servers="$(ptp_read_state_value "$state" NTP_SERVERS || true)"
+    chrony_mode="$(ptp_read_state_value "$state" CHRONY_MODE || echo OFF)"
+    chrony_socket="$(ptp_read_state_value "$state" CHRONY_SOCKET || true)"
+    PTP_CHRONY_CMD_PORT="$(ptp_read_state_value "$state" CHRONY_CMD_PORT || echo 32322)"
+    ntp_status_log="$(ptp_read_state_value "$state" NTP_STATUS_LOG || true)"
+    clock_owner="$(ptp_read_state_value "$state" CLOCK_OWNER || echo unknown)"
+    phc_owner="$(ptp_read_state_value "$state" PHC_OWNER || echo unknown)"
+
+    port_state=unknown; master_offset=unknown; path_delay=unknown
+    if [[ -S ${uds}ro || -S $uds ]]; then
+        [[ -S ${uds}ro ]] && uds="${uds}ro"
+        port_output="$(ptp_pmc_query "$uds" "$pmc_log" 'GET PORT_DATA_SET' 2>/dev/null || true)"
+        current_output="$(ptp_pmc_query "$uds" "$pmc_log" 'GET CURRENT_DATA_SET' 2>/dev/null || true)"
+        port_state="$(awk '/portState/ {print $2; exit}' <<<"$port_output")"
+        master_offset="$(awk '/offsetFromMaster/ {print $2; exit}' <<<"$current_output")"
+        path_delay="$(awk '/meanPathDelay/ {print $2; exit}' <<<"$current_output")"
     fi
+
+    echo "PTP"
+    echo
+    printf '%-20s %s\n' "Role:" "${role^^}"
+    printf '%-20s %s / %s\n' "NIC:" "$family" "$iface"
+    current_phc="$(ptp_phc_for_iface "$iface" 2>/dev/null || echo unavailable)"
+    printf '%-20s %s (recorded %s)\n' "PHC:" "$current_phc" "$phc"
+    printf '%-20s %s\n' "Link:" "$([[ $(ptp_carrier_state "$iface") == 1 ]] && echo UP || echo DOWN)"
+    printf '%-20s %s\n' "State:" "${port_state:-unknown}"
+    [[ $role == slave ]] && printf '%-20s %s\n' "Master offset:" "${master_offset:-unknown}"
+    [[ $role == slave ]] && printf '%-20s %s\n' "Path delay:" "${path_delay:-unknown}"
+    printf '%-20s %s\n' "ptp4l:" "$(kill -0 "$p1" 2>/dev/null && echo "running PID $p1" || echo stopped)"
+    printf '%-20s %s\n' "phc2sys:" "$([[ -n $p2 ]] && kill -0 "$p2" 2>/dev/null && echo "running PID $p2" || echo "not running")"
+
+    echo
+    echo "NTP"
+    echo
+    if [[ $ntp_enabled != YES ]]; then
+        printf '%-20s %s\n' "Mode:" "DISABLED"
+    else
+        printf '%-20s %s\n' "Mode:" "$chrony_mode"
+        printf '%-20s %s\n' "Server(s):" "$ntp_servers"
+        printf '%-20s %s\n' "chronyd:" "$(kill -0 "$p3" 2>/dev/null && echo "running PID $p3" || echo stopped)"
+        if [[ -n $chrony_socket ]]; then
+            ptp_ntp_status_fields "$chrony_socket" "$ntp_status_log"
+        else
+            printf '%-20s %s\n' "Reachability:" "UNAVAILABLE (private socket absent)"
+        fi
+    fi
+
+    conflict=NONE
+    active_services="$(ptp_active_clock_service_units | paste -sd' ' -)"
+    if [[ ( $clock_owner == PHC2SYS || $clock_owner == CHRONYD ) && -n $active_services ]]; then
+        conflict="active system time service conflicts with ptpctl CLOCK_REALTIME owner: $active_services"
+    elif [[ $clock_owner == CHRONYD && $role == slave && -n $p2 ]]; then
+        conflict="slave phc2sys exists while chronyd owns CLOCK_REALTIME"
+    elif [[ $chrony_mode == MONITOR_ONLY && -n $p3 && -r /proc/$p3/cmdline && \
+        ${PTPCTL_TEST_RUNTIME_MOCK:-0} != 1 ]]; then
+        cmdline="$(tr '\0' ' ' < "/proc/$p3/cmdline")"
+        [[ $cmdline == *' -x '* ]] || conflict="monitor-only chronyd is missing -x"
+    fi
+
+    echo
+    echo "Clock Control"
+    echo
+    case $clock_owner in
+        PHC2SYS) printf '%-20s %s\n' "CLOCK_REALTIME:" "PTP / phc2sys" ;;
+        CHRONYD) printf '%-20s %s\n' "CLOCK_REALTIME:" "NTP / chronyd" ;;
+        UNCHANGED) printf '%-20s %s\n' "CLOCK_REALTIME:" "unchanged / external" ;;
+        *) printf '%-20s %s\n' "CLOCK_REALTIME:" "$clock_owner" ;;
+    esac
+    printf '%-20s %s\n' "NIC PHC:" "$phc_owner"
+    [[ $chrony_mode == MONITOR_ONLY ]] && printf '%-20s %s\n' "NTP:" "MONITOR ONLY"
+    printf '%-20s %s\n' "Conflict:" "$conflict"
     echo "Raw log: $PTP_COMMAND_LOG"
 }
 
@@ -322,22 +478,31 @@ cmd_stop() {
     exec 9>"$PTP_RUN_DIR/setup.lock"
     flock -n 9 || { ptp_die "Another ptpctl operation holds the lock" || return; }
     ptp_open_command_log stop
-    local state=$PTP_CURRENT_STATE_FILE p1 p2 config uds
+    local state=$PTP_CURRENT_STATE_FILE p1 p2 p3 config chrony_config chrony_socket uds stopped_services
     if [[ ! -r $state ]]; then
         echo "Nothing to stop: no ptpctl runtime state exists."
         return 0
     fi
     p1="$(ptp_read_state_value "$state" PTP4L_PID || true)"
     p2="$(ptp_read_state_value "$state" PHC2SYS_PID || true)"
+    p3="$(ptp_read_state_value "$state" CHRONYD_PID || true)"
     config="$(ptp_read_state_value "$state" RUNTIME_CONFIG || true)"
+    chrony_config="$(ptp_read_state_value "$state" CHRONY_CONFIG || true)"
+    chrony_socket="$(ptp_read_state_value "$state" CHRONY_SOCKET || true)"
+    stopped_services="$(ptp_read_state_value "$state" STOPPED_SERVICES || true)"
     uds="$(ptp_read_state_value "$state" UDS || true)"
     ptp_stop_pid "$p2" phc2sys
     ptp_stop_pid "$p1" ptp4l
+    ptp_stop_pid "$p3" chronyd
+    ptp_restore_stopped_services "$stopped_services"
     rm -f "$state"
     [[ -n $config ]] && rm -f "$config"
+    [[ -n $chrony_config ]] && rm -f "$chrony_config"
     [[ -n $uds ]] && rm -f "$uds" "${uds}ro"
+    [[ $chrony_socket == /* ]] && rm -f "$chrony_socket"
+    rm -f "$PTP_RUN_DIR/chronyd.pid" "$PTP_RUN_DIR/chronyd.drift"
     ptp_ok "Stopped ptpctl-owned processes and removed transient runtime files"
-    echo "Network links, NIC drivers, clock services, logs, and boot settings were not changed."
+    echo "Previously active clock services were restored when applicable; logs were preserved."
 }
 
 main() {
